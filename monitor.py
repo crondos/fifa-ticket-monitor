@@ -211,11 +211,39 @@ async def scrape_tickets() -> list[dict]:
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
+FAKE_TICKETS = [
+    {
+        "id": "test-001",
+        "price": 299,
+        "venue": "MetLife Stadium",
+        "match": "USA vs Brazil - Quarter Final",
+        "date": "2026-07-05T19:00:00",
+        "url": "https://tickets.fifa.com",
+    },
+    {
+        "id": "test-002",
+        "price": 749,
+        "venue": "Lincoln Financial Field",
+        "match": "Argentina vs England - Round of 16",
+        "date": "2026-07-01T15:00:00",
+        "url": "https://tickets.fifa.com",
+    },
+]
+
+
 async def main():
+    test_mode = os.environ.get("TEST_MODE", "").lower() in ("1", "true", "yes")
+
     state = load_state()
     notified_ids = set(state.get("notified_ids", []))
     last_notified = state.get("last_notified", 0)
     now = time.time()
+
+    if test_mode:
+        print("TEST MODE — skipping scraper, sending fake ticket email...")
+        send_email(FAKE_TICKETS)
+        print("Done.")
+        sys.exit(0)
 
     tickets = await scrape_tickets()
     print(f"Found {len(tickets)} matching ticket(s)")

@@ -3,7 +3,12 @@ name: FIFA World Cup Ticket Monitor
 on:
   schedule:
     - cron: '*/10 * * * *'  # Every 10 minutes
-  workflow_dispatch:          # Also allows manual "Run workflow" button in GitHub UI
+  workflow_dispatch:
+    inputs:
+      test_mode:
+        description: 'Send a fake ticket alert to test email delivery'
+        type: boolean
+        default: false
 
 jobs:
   monitor:
@@ -39,6 +44,7 @@ jobs:
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          TEST_MODE: ${{ inputs.test_mode }}
         run: python monitor.py
 
       - name: Save notification state
