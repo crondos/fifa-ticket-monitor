@@ -1,0 +1,49 @@
+name: FIFA World Cup Ticket Monitor
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'  # Every 10 minutes
+  workflow_dispatch:          # Also allows manual "Run workflow" button in GitHub UI
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Playwright browser
+        run: playwright install chromium --with-deps
+
+      # Restore previous run's state so we don't re-alert for the same tickets
+      - name: Restore notification state
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: ticket-state-${{ github.run_id }}
+          restore-keys: ticket-state-
+
+      - name: Run ticket monitor
+        env:
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+        run: python monitor.py
+
+      - name: Save notification state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: ticket-state-${{ github.run_id }}
