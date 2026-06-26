@@ -44,6 +44,8 @@ jobs:
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          FIFA_EMAIL: ${{ secrets.FIFA_EMAIL }}
+          FIFA_PASSWORD: ${{ secrets.FIFA_PASSWORD }}
           TEST_MODE: ${{ inputs.test_mode }}
         run: python monitor.py
 

@@ -32,6 +32,7 @@ TARGET_VENUES = [
 ]
 MAX_PRICE_USD = 1000
 FIFA_BASE_URL = "https://tickets.fifa.com"
+FIFA_LOGIN_URL = "https://tickets.fifa.com/en/login"
 STUBHUB_SEARCH_URL = (
     "https://www.stubhub.com/search?q=FIFA+World+Cup+2026"
 )
@@ -40,6 +41,9 @@ STATE_FILE = Path("state.json")
 EMAIL_FROM = os.environ["EMAIL_FROM"]
 EMAIL_TO = os.environ.get("EMAIL_TO", "charlesrondos@yahoo.com")
 EMAIL_PASSWORD = os.environ["EMAIL_PASSWORD"]
+
+FIFA_EMAIL = os.environ.get("FIFA_EMAIL", "")
+FIFA_PASSWORD = os.environ.get("FIFA_PASSWORD", "")
 
 COOLDOWN_SECONDS = 1800  # 30 min between repeat alerts for same tickets
 
@@ -163,6 +167,59 @@ def _browser_context_args():
 
 
 # ── FIFA scraper ──────────────────────────────────────────────────────────────
+async def _fifa_login(page) -> bool:
+    """Log into FIFA ticketing. Returns True if login succeeded."""
+    if not FIFA_EMAIL or not FIFA_PASSWORD:
+        print("FIFA: no credentials provided, skipping login")
+        return False
+    try:
+        print("FIFA: logging in...")
+        await page.goto(FIFA_LOGIN_URL, wait_until="networkidle", timeout=30000)
+        await page.wait_for_timeout(2000)
+
+        # Fill email
+        for sel in ["input[type='email']", "input[name='email']", "input[id*='email']"]:
+            try:
+                el = page.locator(sel).first
+                if await el.is_visible(timeout=2000):
+                    await el.fill(FIFA_EMAIL)
+                    break
+            except Exception:
+                pass
+
+        # Fill password
+        for sel in ["input[type='password']", "input[name='password']", "input[id*='password']"]:
+            try:
+                el = page.locator(sel).first
+                if await el.is_visible(timeout=2000):
+                    await el.fill(FIFA_PASSWORD)
+                    break
+            except Exception:
+                pass
+
+        # Submit
+        for sel in ["button[type='submit']", "button:has-text('Sign in')",
+                    "button:has-text('Log in')", "button:has-text('Login')"]:
+            try:
+                el = page.locator(sel).first
+                if await el.is_visible(timeout=2000):
+                    await el.click()
+                    await page.wait_for_timeout(4000)
+                    break
+            except Exception:
+                pass
+
+        # Confirm we're no longer on the login page
+        if "login" not in page.url.lower():
+            print("FIFA: login successful")
+            return True
+        print("FIFA: login may have failed — still on login page")
+        return False
+    except Exception as e:
+        print(f"FIFA: login error: {e}")
+        return False
+
+
 async def scrape_fifa() -> list[dict]:
     captured = []
 
@@ -183,15 +240,19 @@ async def scrape_fifa() -> list[dict]:
 
         page.on("response", on_response)
 
+        await _fifa_login(page)
+
         try:
-            print("FIFA: loading page...")
+            print("FIFA: loading ticket listings...")
             await page.goto(FIFA_BASE_URL, wait_until="networkidle", timeout=45000)
             await page.wait_for_timeout(4000)
         except Exception as e:
             print(f"FIFA: page load warning: {e}")
 
-        for sel in ["a[href*='ticket']", "a[href*='match']",
-                    "button:has-text('Tickets')", "a:has-text('Buy Tickets')"]:
+        # Try navigating into resale / ticket listings
+        for sel in ["a[href*='resale']", "a[href*='ticket']", "a[href*='match']",
+                    "button:has-text('Tickets')", "a:has-text('Buy Tickets')",
+                    "a:has-text('Resale')"]:
             try:
                 el = page.locator(sel).first
                 if await el.is_visible(timeout=1500):
