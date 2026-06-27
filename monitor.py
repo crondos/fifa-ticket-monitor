@@ -9,6 +9,7 @@ Sends email when found.
 import asyncio
 import json
 import os
+import re
 import smtplib
 import ssl
 import sys
@@ -19,6 +20,7 @@ from email.mime.text import MIMEText
 from pathlib import Path
 
 from playwright.async_api import async_playwright
+from playwright_stealth import stealth_async
 
 # ── Config ────────────────────────────────────────────────────────────────────
 TARGET_VENUES = [
@@ -32,7 +34,6 @@ TARGET_VENUES = [
 ]
 MAX_PRICE_USD = 1000
 FIFA_BASE_URL = "https://tickets.fifa.com"
-FIFA_LOGIN_URL = "https://tickets.fifa.com/en/login"
 STUBHUB_SEARCH_URL = "https://www.stubhub.com/search?q=FIFA+World+Cup+2026"
 STATE_FILE = Path("state.json")
 
@@ -47,9 +48,34 @@ DEBUG_MODE = os.environ.get("DEBUG_MODE", "").lower() in ("1", "true", "yes")
 COOLDOWN_SECONDS = 1800
 
 
-# ── Venue matching ────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 def is_target_venue(text: str) -> bool:
     return any(v in text.lower() for v in TARGET_VENUES)
+
+
+def parse_price(text: str) -> float | None:
+    """Extract the lowest dollar amount from a string like 'from $450' or '$1,200'."""
+    matches = re.findall(r'\$\s*([\d,]+(?:\.\d{1,2})?)', text)
+    prices = []
+    for m in matches:
+        try:
+            prices.append(float(m.replace(",", "")))
+        except ValueError:
+            pass
+    return min(prices) if prices else None
+
+
+def _browser_args():
+    return dict(
+        user_agent=(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/125.0.0.0 Safari/537.36"
+        ),
+        viewport={"width": 1280, "height": 900},
+        locale="en-US",
+        timezone_id="America/New_York",
+    )
 
 
 # ── State ─────────────────────────────────────────────────────────────────────
@@ -64,20 +90,6 @@ def load_state() -> dict:
 
 def save_state(state: dict):
     STATE_FILE.write_text(json.dumps(state, indent=2))
-
-
-# ── Debug helper ──────────────────────────────────────────────────────────────
-def _debug_structure(obj, depth=0):
-    """Compact structural summary for debugging — shows keys/types without values."""
-    if depth > 3:
-        return "..."
-    if isinstance(obj, dict):
-        return {k: _debug_structure(v, depth + 1) for k, v in list(obj.items())[:10]}
-    if isinstance(obj, list):
-        if not obj:
-            return []
-        return [_debug_structure(obj[0], depth + 1), f"...({len(obj)} items)"]
-    return f"{type(obj).__name__}={repr(obj)[:40]}"
 
 
 # ── Email ─────────────────────────────────────────────────────────────────────
@@ -110,224 +122,11 @@ def send_email(tickets: list[dict]):
     ]
 
     msg.attach(MIMEText("\n".join(lines), "plain"))
-
     ctx = ssl.create_default_context()
     with smtplib.SMTP_SSL("smtp.mail.yahoo.com", 465, context=ctx) as server:
         server.login(EMAIL_FROM, EMAIL_PASSWORD)
         server.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
     print(f"Alert email sent to {EMAIL_TO}")
-
-
-# ── Generic JSON extractor ────────────────────────────────────────────────────
-_PRICE_KEYS = {"price", "Price", "amount", "Amount", "faceValue", "basePrice",
-               "totalPrice", "cost", "listingPrice", "currentPrice", "minPrice",
-               "ticketLow", "priceFrom", "lowestPrice"}
-_VENUE_KEYS = {"venue", "Venue", "stadium", "Stadium", "location", "Location",
-               "venueName", "venueeName"}
-_MATCH_KEYS = {"match", "matchName", "title", "name", "eventName", "description",
-               "event", "eventTitle"}
-_DATE_KEYS  = {"date", "startDate", "dateTime", "kickoff", "matchDate",
-               "eventDate", "eventDateLocal", "performanceDate"}
-_LINK_KEYS  = {"url", "link", "purchaseUrl", "ticketUrl", "href", "eventUrl", "listingUrl"}
-
-
-def _extract(obj, source: str, fallback_url: str, depth=0) -> list[dict]:
-    if depth > 12:
-        return []
-    results = []
-    if isinstance(obj, list):
-        for item in obj:
-            results.extend(_extract(item, source, fallback_url, depth + 1))
-    elif isinstance(obj, dict):
-        price_val = next((obj[k] for k in _PRICE_KEYS if k in obj), None)
-        venue_val = next((obj[k] for k in _VENUE_KEYS if k in obj), None)
-        # Also handle nested venue objects: {"venue": {"name": "MetLife"}}
-        if venue_val is None and "venue" in obj and isinstance(obj["venue"], dict):
-            venue_val = obj["venue"].get("name") or obj["venue"].get("venueName")
-        if price_val is not None and venue_val is not None:
-            try:
-                price = float(str(price_val).replace("$", "").replace(",", "").strip())
-                ticket_id = f"{source}:{obj.get('id') or obj.get('ticketId') or obj.get('listingId') or f'{venue_val}_{price}'}"
-                link = next((str(obj[k]) for k in _LINK_KEYS if k in obj), fallback_url)
-                results.append({
-                    "id": ticket_id,
-                    "source": source,
-                    "price": price,
-                    "venue": str(venue_val),
-                    "match": str(next((obj[k] for k in _MATCH_KEYS if k in obj), "Unknown Match")),
-                    "date": str(next((obj[k] for k in _DATE_KEYS if k in obj), "TBD")),
-                    "url": link if link.startswith("http") else fallback_url,
-                })
-            except (ValueError, TypeError):
-                pass
-        for v in obj.values():
-            if isinstance(v, (dict, list)):
-                results.extend(_extract(v, source, fallback_url, depth + 1))
-    return results
-
-
-# ── StubHub-specific extractor ────────────────────────────────────────────────
-def _extract_stubhub(obj, depth=0) -> list[dict]:
-    """
-    Handles StubHub's event-level structure where venue and price
-    live at different nesting levels within the same event object.
-    """
-    if depth > 8:
-        return []
-    results = []
-    if isinstance(obj, list):
-        for item in obj:
-            results.extend(_extract_stubhub(item, depth + 1))
-    elif isinstance(obj, dict):
-        # Resolve venue — direct string or nested {"venue": {"name": ...}}
-        venue_val = next((str(obj[k]) for k in ["venueName", "venue_name"] if k in obj and isinstance(obj[k], str)), None)
-        if venue_val is None and "venue" in obj:
-            v = obj["venue"]
-            venue_val = v if isinstance(v, str) else (v.get("name") or v.get("venueName") if isinstance(v, dict) else None)
-
-        if venue_val and is_target_venue(venue_val):
-            # Resolve price — direct or nested in ticketInfo / priceRange
-            price_val = next((obj[k] for k in ["ticketLow", "minPrice", "priceFrom",
-                                                 "lowestPrice", "price", "minTicketPrice"] if k in obj), None)
-            if price_val is None and isinstance(obj.get("ticketInfo"), dict):
-                ti = obj["ticketInfo"]
-                price_val = ti.get("minPrice") or ti.get("lowPrice") or ti.get("price")
-            if price_val is None and isinstance(obj.get("priceRange"), dict):
-                pr = obj["priceRange"]
-                price_val = pr.get("min") or pr.get("low") or pr.get("minimum")
-
-            if price_val is not None:
-                try:
-                    price = float(str(price_val).replace("$", "").replace(",", "").strip())
-                    if 0 < price < MAX_PRICE_USD:
-                        name = next((str(obj[k]) for k in ["name", "title", "eventName",
-                                                             "description", "eventTitle"] if k in obj),
-                                    "FIFA World Cup 2026")
-                        date = next((str(obj[k]) for k in ["eventDateLocal", "startDate",
-                                                             "dateTime", "date", "performanceDate"] if k in obj), "TBD")
-                        link = next((str(obj[k]) for k in ["eventUrl", "url", "link", "href"] if k in obj),
-                                    STUBHUB_SEARCH_URL)
-                        results.append({
-                            "id": f"StubHub:{obj.get('id', f'{venue_val}_{price}')}",
-                            "source": "StubHub",
-                            "price": price,
-                            "venue": venue_val,
-                            "match": name,
-                            "date": date,
-                            "url": link if link.startswith("http") else STUBHUB_SEARCH_URL,
-                        })
-                except (ValueError, TypeError):
-                    pass
-
-        for v in obj.values():
-            if isinstance(v, (dict, list)):
-                results.extend(_extract_stubhub(v, depth + 1))
-    return results
-
-
-# ── Browser helper ────────────────────────────────────────────────────────────
-def _browser_args():
-    return dict(
-        user_agent=(
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/125.0.0.0 Safari/537.36"
-        ),
-        viewport={"width": 1280, "height": 900},
-        locale="en-US",
-        timezone_id="America/New_York",
-    )
-
-
-# ── FIFA login ────────────────────────────────────────────────────────────────
-async def _fifa_login(page) -> bool:
-    if not FIFA_EMAIL or not FIFA_PASSWORD:
-        print("FIFA: no credentials provided, skipping login")
-        return False
-    try:
-        print("FIFA: navigating to login page...")
-        await page.goto(FIFA_LOGIN_URL, wait_until="networkidle", timeout=30000)
-        await page.wait_for_timeout(2000)
-
-        if DEBUG_MODE:
-            await page.screenshot(path="fifa_login_before.png")
-            print(f"FIFA: login page URL = {page.url}")
-            print(f"FIFA: page title = {await page.title()}")
-
-        # Step 1 — email field (handles both single-page and two-step flows)
-        email_filled = False
-        for sel in ["input[type='email']", "input[name='email']",
-                    "input[id*='email']", "input[placeholder*='email' i]",
-                    "input[autocomplete='email']"]:
-            try:
-                el = page.locator(sel).first
-                if await el.is_visible(timeout=2000):
-                    await el.fill(FIFA_EMAIL)
-                    email_filled = True
-                    print(f"FIFA: filled email using selector '{sel}'")
-                    break
-            except Exception:
-                pass
-
-        if not email_filled:
-            print("FIFA: could not find email field")
-
-        # Some flows show email → Continue → then password on next screen
-        for sel in ["button:has-text('Continue')", "button:has-text('Next')",
-                    "button[type='submit']:not(:has-text('Sign'))"]:
-            try:
-                el = page.locator(sel).first
-                if await el.is_visible(timeout=1500):
-                    await el.click()
-                    await page.wait_for_timeout(2000)
-                    break
-            except Exception:
-                pass
-
-        # Step 2 — password field
-        pw_filled = False
-        for sel in ["input[type='password']", "input[name='password']",
-                    "input[id*='password']", "input[autocomplete='current-password']"]:
-            try:
-                el = page.locator(sel).first
-                if await el.is_visible(timeout=3000):
-                    await el.fill(FIFA_PASSWORD)
-                    pw_filled = True
-                    print(f"FIFA: filled password using selector '{sel}'")
-                    break
-            except Exception:
-                pass
-
-        if not pw_filled:
-            print("FIFA: could not find password field")
-
-        # Submit
-        for sel in ["button[type='submit']", "button:has-text('Sign in')",
-                    "button:has-text('Log in')", "button:has-text('Login')",
-                    "button:has-text('Continue')"]:
-            try:
-                el = page.locator(sel).first
-                if await el.is_visible(timeout=2000):
-                    await el.click()
-                    await page.wait_for_timeout(5000)
-                    break
-            except Exception:
-                pass
-
-        if DEBUG_MODE:
-            await page.screenshot(path="fifa_login_after.png")
-            print(f"FIFA: post-login URL = {page.url}")
-
-        if "login" not in page.url.lower() and "signin" not in page.url.lower():
-            print("FIFA: login successful")
-            return True
-
-        print(f"FIFA: login failed — still on {page.url}")
-        return False
-
-    except Exception as e:
-        print(f"FIFA: login error: {e}")
-        return False
 
 
 # ── FIFA scraper ──────────────────────────────────────────────────────────────
@@ -341,6 +140,7 @@ async def scrape_fifa() -> list[dict]:
         )
         ctx = await browser.new_context(**_browser_args())
         page = await ctx.new_page()
+        await stealth_async(page)  # mask headless fingerprint
 
         async def on_response(response):
             if response.status == 200 and "json" in response.headers.get("content-type", ""):
@@ -350,18 +150,115 @@ async def scrape_fifa() -> list[dict]:
                     pass
 
         page.on("response", on_response)
-        await _fifa_login(page)
 
+        # Load homepage (not login URL directly — avoids "Bad request")
+        try:
+            print("FIFA: loading homepage...")
+            await page.goto(FIFA_BASE_URL, wait_until="networkidle", timeout=45000)
+            await page.wait_for_timeout(3000)
+        except Exception as e:
+            print(f"FIFA: homepage load warning: {e}")
+
+        if DEBUG_MODE:
+            await page.screenshot(path="fifa_homepage.png")
+            print(f"FIFA: homepage title = {await page.title()}, url = {page.url}")
+
+        # Click the sign-in button in the nav
+        if FIFA_EMAIL and FIFA_PASSWORD:
+            print("FIFA: looking for sign-in button...")
+            signed_in = False
+            for sel in [
+                "a:has-text('Sign in')", "button:has-text('Sign in')",
+                "a:has-text('Login')", "button:has-text('Login')",
+                "a:has-text('Log in')", "button:has-text('Log in')",
+                "a[href*='login']", "a[href*='signin']",
+                "[data-testid*='login']", "[data-testid*='signin']",
+                "[aria-label*='sign' i]", "[aria-label*='login' i]",
+            ]:
+                try:
+                    el = page.locator(sel).first
+                    if await el.is_visible(timeout=1500):
+                        await el.click()
+                        await page.wait_for_timeout(3000)
+                        print(f"FIFA: clicked '{sel}', now at {page.url}")
+                        signed_in = True
+                        break
+                except Exception:
+                    pass
+
+            if signed_in or "login" in page.url.lower() or "signin" in page.url.lower():
+                if DEBUG_MODE:
+                    await page.screenshot(path="fifa_login_before.png")
+                    print(f"FIFA: login page title = {await page.title()}")
+
+                # Fill email — handle single-page and two-step flows
+                for sel in ["input[type='email']", "input[name='email']",
+                            "input[id*='email' i]", "input[placeholder*='email' i]",
+                            "input[autocomplete='email']", "input[autocomplete='username']"]:
+                    try:
+                        el = page.locator(sel).first
+                        if await el.is_visible(timeout=2000):
+                            await el.fill(FIFA_EMAIL)
+                            print(f"FIFA: filled email via '{sel}'")
+                            break
+                    except Exception:
+                        pass
+
+                # Some flows: email → Continue → password on next screen
+                for sel in ["button:has-text('Continue')", "button:has-text('Next')"]:
+                    try:
+                        el = page.locator(sel).first
+                        if await el.is_visible(timeout=1500):
+                            await el.click()
+                            await page.wait_for_timeout(2000)
+                            break
+                    except Exception:
+                        pass
+
+                # Fill password
+                for sel in ["input[type='password']", "input[name='password']",
+                            "input[id*='password' i]", "input[autocomplete='current-password']"]:
+                    try:
+                        el = page.locator(sel).first
+                        if await el.is_visible(timeout=3000):
+                            await el.fill(FIFA_PASSWORD)
+                            print(f"FIFA: filled password via '{sel}'")
+                            break
+                    except Exception:
+                        pass
+
+                # Submit
+                for sel in ["button[type='submit']", "button:has-text('Sign in')",
+                            "button:has-text('Log in')", "button:has-text('Login')",
+                            "button:has-text('Continue')"]:
+                    try:
+                        el = page.locator(sel).first
+                        if await el.is_visible(timeout=2000):
+                            await el.click()
+                            await page.wait_for_timeout(5000)
+                            break
+                    except Exception:
+                        pass
+
+                if DEBUG_MODE:
+                    await page.screenshot(path="fifa_login_after.png")
+                    print(f"FIFA: post-login url = {page.url}")
+
+                if "login" not in page.url.lower() and "signin" not in page.url.lower():
+                    print("FIFA: login successful")
+                else:
+                    print(f"FIFA: login may have failed, still at {page.url}")
+
+        # Now browse ticket/resale listings
         try:
             print("FIFA: loading ticket listings...")
             await page.goto(FIFA_BASE_URL, wait_until="networkidle", timeout=45000)
             await page.wait_for_timeout(4000)
         except Exception as e:
-            print(f"FIFA: page load warning: {e}")
+            print(f"FIFA: ticket page warning: {e}")
 
         for sel in ["a[href*='resale']", "a[href*='ticket']", "a[href*='match']",
-                    "button:has-text('Tickets')", "a:has-text('Buy Tickets')",
-                    "a:has-text('Resale')"]:
+                    "a:has-text('Resale')", "a:has-text('Buy Tickets')"]:
             try:
                 el = page.locator(sel).first
                 if await el.is_visible(timeout=1500):
@@ -376,22 +273,19 @@ async def scrape_fifa() -> list[dict]:
     print(f"FIFA: captured {len(captured)} API responses")
     if DEBUG_MODE:
         for r in captured:
-            print(f"  {r['url']}")
-            print(f"  {json.dumps(_debug_structure(r['data']), indent=2)[:400]}\n")
+            print(f"  {r['url']}: {list(r['data'].keys()) if isinstance(r['data'], dict) else type(r['data']).__name__}")
 
     found = []
     for resp in captured:
-        for ticket in _extract(resp["data"], "FIFA", FIFA_BASE_URL):
+        for ticket in _extract_json(resp["data"], "FIFA", FIFA_BASE_URL):
             if is_target_venue(ticket["venue"] + " " + ticket["match"]) and 0 < ticket["price"] < MAX_PRICE_USD:
                 found.append(ticket)
     print(f"FIFA: {len(found)} matching ticket(s)")
     return found
 
 
-# ── StubHub scraper ───────────────────────────────────────────────────────────
+# ── StubHub scraper (DOM-based) ───────────────────────────────────────────────
 async def scrape_stubhub() -> list[dict]:
-    captured = []
-
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
             headless=True,
@@ -399,56 +293,149 @@ async def scrape_stubhub() -> list[dict]:
         )
         ctx = await browser.new_context(**_browser_args())
         page = await ctx.new_page()
-
-        async def on_response(response):
-            if response.status == 200 and "json" in response.headers.get("content-type", ""):
-                if "stubhub" in response.url:
-                    try:
-                        captured.append({"url": response.url, "data": await response.json()})
-                    except Exception:
-                        pass
-
-        page.on("response", on_response)
+        await stealth_async(page)
 
         try:
             print("StubHub: loading search page...")
             await page.goto(STUBHUB_SEARCH_URL, wait_until="networkidle", timeout=45000)
             await page.wait_for_timeout(5000)
-
-            for sel in ["a:has-text('FIFA World Cup')", "a:has-text('World Cup 2026')",
-                        "[data-testid='event-card']"]:
-                try:
-                    el = page.locator(sel).first
-                    if await el.is_visible(timeout=2000):
-                        await el.click()
-                        await page.wait_for_timeout(4000)
-                        break
-                except Exception:
-                    pass
         except Exception as e:
             print(f"StubHub: page load warning: {e}")
 
+        if DEBUG_MODE:
+            await page.screenshot(path="stubhub_results.png")
+            print(f"StubHub: page title = {await page.title()}")
+
+        # Extract event cards from the DOM using JavaScript
+        raw_cards = await page.evaluate("""() => {
+            const results = [];
+            // Collect all anchor elements pointing to event/ticket pages
+            document.querySelectorAll('a[href]').forEach(a => {
+                const href = a.href || '';
+                if (!href.includes('stubhub')) return;
+                const text = (a.innerText || a.textContent || '').trim();
+                if (!text || text.length < 10) return;
+                // Only keep cards that look like event listings (have a price)
+                if (!text.includes('$')) return;
+                results.push({ href, text });
+            });
+            // Also try common card container selectors
+            const selectors = [
+                '[data-testid*="card"]', '[data-testid*="event"]',
+                '[class*="EventCard"]', '[class*="event-card"]',
+                '[class*="primaryCard"]', '[class*="listing"]',
+            ];
+            selectors.forEach(sel => {
+                document.querySelectorAll(sel).forEach(el => {
+                    const text = (el.innerText || '').trim();
+                    const link = el.querySelector('a');
+                    if (text && text.includes('$')) {
+                        results.push({ href: link?.href || '', text });
+                    }
+                });
+            });
+            return results;
+        }""")
+
         await browser.close()
 
-    print(f"StubHub: captured {len(captured)} API responses")
+    print(f"StubHub: found {len(raw_cards)} raw DOM cards")
     if DEBUG_MODE:
-        for r in captured:
-            print(f"  {r['url']}")
-            print(f"  {json.dumps(_debug_structure(r['data']), indent=2)[:400]}\n")
+        for c in raw_cards[:5]:
+            print(f"  href={c['href'][:80]}")
+            print(f"  text={c['text'][:200]}\n")
 
     found = []
-    for resp in captured:
-        # Try StubHub-specific extractor first, fall back to generic
-        specific = _extract_stubhub(resp["data"])
-        generic = _extract(resp["data"], "StubHub", STUBHUB_SEARCH_URL)
-        seen_ids = {t["id"] for t in specific}
-        combined = specific + [t for t in generic if t["id"] not in seen_ids]
-        for ticket in combined:
-            if is_target_venue(ticket["venue"] + " " + ticket["match"]) and 0 < ticket["price"] < MAX_PRICE_USD:
-                found.append(ticket)
+    seen_ids = set()
+    for card in raw_cards:
+        text = card.get("text", "")
+        href = card.get("href", STUBHUB_SEARCH_URL)
+
+        if not is_target_venue(text):
+            continue
+
+        price = parse_price(text)
+        if price is None or not (0 < price < MAX_PRICE_USD):
+            continue
+
+        # Identify venue
+        venue = next((v.title() for v in TARGET_VENUES if v in text.lower()), "Unknown Venue")
+        # Normalize some venue names
+        venue_map = {
+            "Metlife": "MetLife Stadium",
+            "Gillette": "Gillette Stadium",
+            "Lincoln Financial": "Lincoln Financial Field",
+            "East Rutherford": "MetLife Stadium",
+            "Foxborough": "Gillette Stadium",
+            "Foxboro": "Gillette Stadium",
+            "Philadelphia": "Lincoln Financial Field",
+        }
+        venue = venue_map.get(venue, venue)
+
+        ticket_id = f"StubHub:{href or text[:60]}"
+        if ticket_id in seen_ids:
+            continue
+        seen_ids.add(ticket_id)
+
+        # Best-effort match/date extraction from card text
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        match_name = lines[0] if lines else "FIFA World Cup 2026"
+
+        found.append({
+            "id": ticket_id,
+            "source": "StubHub",
+            "price": price,
+            "venue": venue,
+            "match": match_name,
+            "date": "See link",
+            "url": href if href.startswith("http") else STUBHUB_SEARCH_URL,
+        })
 
     print(f"StubHub: {len(found)} matching ticket(s)")
     return found
+
+
+# ── Generic JSON extractor (for FIFA API responses) ───────────────────────────
+_PRICE_KEYS = {"price", "Price", "amount", "faceValue", "basePrice", "totalPrice",
+               "cost", "listingPrice", "currentPrice", "minPrice", "ticketLow"}
+_VENUE_KEYS = {"venue", "Venue", "stadium", "Stadium", "location", "venueName"}
+_MATCH_KEYS = {"match", "matchName", "title", "name", "eventName", "description", "eventTitle"}
+_DATE_KEYS  = {"date", "startDate", "dateTime", "kickoff", "matchDate", "eventDateLocal"}
+_LINK_KEYS  = {"url", "link", "purchaseUrl", "ticketUrl", "eventUrl", "listingUrl"}
+
+
+def _extract_json(obj, source: str, fallback_url: str, depth=0) -> list[dict]:
+    if depth > 12:
+        return []
+    results = []
+    if isinstance(obj, list):
+        for item in obj:
+            results.extend(_extract_json(item, source, fallback_url, depth + 1))
+    elif isinstance(obj, dict):
+        price_val = next((obj[k] for k in _PRICE_KEYS if k in obj), None)
+        venue_val = next((obj[k] for k in _VENUE_KEYS if k in obj), None)
+        if venue_val is None and isinstance(obj.get("venue"), dict):
+            venue_val = obj["venue"].get("name") or obj["venue"].get("venueName")
+        if price_val is not None and venue_val is not None:
+            try:
+                price = float(str(price_val).replace("$", "").replace(",", "").strip())
+                ticket_id = f"{source}:{obj.get('id') or obj.get('ticketId') or f'{venue_val}_{price}'}"
+                link = next((str(obj[k]) for k in _LINK_KEYS if k in obj), fallback_url)
+                results.append({
+                    "id": ticket_id,
+                    "source": source,
+                    "price": price,
+                    "venue": str(venue_val),
+                    "match": str(next((obj[k] for k in _MATCH_KEYS if k in obj), "Unknown Match")),
+                    "date": str(next((obj[k] for k in _DATE_KEYS if k in obj), "TBD")),
+                    "url": link if link.startswith("http") else fallback_url,
+                })
+            except (ValueError, TypeError):
+                pass
+        for v in obj.values():
+            if isinstance(v, (dict, list)):
+                results.extend(_extract_json(v, source, fallback_url, depth + 1))
+    return results
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
