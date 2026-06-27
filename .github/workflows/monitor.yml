@@ -9,6 +9,10 @@ on:
         description: 'Send a fake ticket alert to test email delivery'
         type: boolean
         default: false
+      debug_mode:
+        description: 'Print API response structure + save FIFA login screenshots'
+        type: boolean
+        default: false
 
 jobs:
   monitor:
@@ -31,7 +35,6 @@ jobs:
       - name: Install Playwright browser
         run: playwright install chromium --with-deps
 
-      # Restore previous run's state so we don't re-alert for the same tickets
       - name: Restore notification state
         uses: actions/cache/restore@v4
         with:
@@ -47,7 +50,16 @@ jobs:
           FIFA_EMAIL: ${{ secrets.FIFA_EMAIL }}
           FIFA_PASSWORD: ${{ secrets.FIFA_PASSWORD }}
           TEST_MODE: ${{ inputs.test_mode }}
+          DEBUG_MODE: ${{ inputs.debug_mode }}
         run: python monitor.py
+
+      - name: Upload FIFA login screenshots
+        if: inputs.debug_mode
+        uses: actions/upload-artifact@v4
+        with:
+          name: fifa-login-debug
+          path: fifa_login_*.png
+          if-no-files-found: ignore
 
       - name: Save notification state
         if: always()
