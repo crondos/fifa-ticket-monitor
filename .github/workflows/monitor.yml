@@ -32,8 +32,8 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Install Playwright browser
-        run: playwright install chromium --with-deps
+      - name: Install Playwright browsers
+        run: playwright install chromium firefox --with-deps
 
       - name: Restore notification state
         uses: actions/cache/restore@v4

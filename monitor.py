@@ -35,6 +35,11 @@ TARGET_VENUES = [
 MAX_PRICE_USD = 1000
 FIFA_BASE_URL = "https://tickets.fifa.com"
 STUBHUB_SEARCH_URL = "https://www.stubhub.com/search?q=FIFA+World+Cup+2026"
+STUBHUB_VENUE_URLS = {
+    "MetLife Stadium":        "https://www.stubhub.com/metlife-stadium-east-rutherford-tickets/",
+    "Gillette Stadium":       "https://www.stubhub.com/gillette-stadium-foxborough-tickets/",
+    "Lincoln Financial Field":"https://www.stubhub.com/lincoln-financial-field-philadelphia-tickets/",
+}
 STATE_FILE = Path("state.json")
 
 EMAIL_FROM = os.environ["EMAIL_FROM"]
@@ -129,18 +134,15 @@ def send_email(tickets: list[dict]):
     print(f"Alert email sent to {EMAIL_TO}")
 
 
-# ── FIFA scraper ──────────────────────────────────────────────────────────────
+# ── FIFA scraper (Firefox — less fingerprinted than Chromium) ─────────────────
 async def scrape_fifa() -> list[dict]:
     captured = []
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
-        )
+        # Firefox is far less likely to get "Bad request" from anti-bot systems
+        browser = await pw.firefox.launch(headless=True)
         ctx = await browser.new_context(**_browser_args())
         page = await ctx.new_page()
-        await stealth_async(page)  # mask headless fingerprint
 
         async def on_response(response):
             if response.status == 200 and "json" in response.headers.get("content-type", ""):
@@ -151,107 +153,98 @@ async def scrape_fifa() -> list[dict]:
 
         page.on("response", on_response)
 
-        # Load homepage (not login URL directly — avoids "Bad request")
+        # Load homepage first — direct /login URL was returning "Bad request"
         try:
-            print("FIFA: loading homepage...")
+            print("FIFA: loading homepage via Firefox...")
             await page.goto(FIFA_BASE_URL, wait_until="networkidle", timeout=45000)
             await page.wait_for_timeout(3000)
+            print(f"FIFA: homepage title = {await page.title()}")
         except Exception as e:
-            print(f"FIFA: homepage load warning: {e}")
+            print(f"FIFA: homepage warning: {e}")
 
         if DEBUG_MODE:
             await page.screenshot(path="fifa_homepage.png")
-            print(f"FIFA: homepage title = {await page.title()}, url = {page.url}")
 
-        # Click the sign-in button in the nav
+        # Sign in if credentials supplied
         if FIFA_EMAIL and FIFA_PASSWORD:
             print("FIFA: looking for sign-in button...")
-            signed_in = False
             for sel in [
                 "a:has-text('Sign in')", "button:has-text('Sign in')",
-                "a:has-text('Login')", "button:has-text('Login')",
-                "a:has-text('Log in')", "button:has-text('Log in')",
-                "a[href*='login']", "a[href*='signin']",
-                "[data-testid*='login']", "[data-testid*='signin']",
-                "[aria-label*='sign' i]", "[aria-label*='login' i]",
+                "a:has-text('Login')",   "button:has-text('Login')",
+                "a:has-text('Log in')",  "button:has-text('Log in')",
+                "a[href*='login']",      "a[href*='signin']",
+                "[data-testid*='login']","[aria-label*='sign' i]",
             ]:
                 try:
                     el = page.locator(sel).first
                     if await el.is_visible(timeout=1500):
                         await el.click()
                         await page.wait_for_timeout(3000)
-                        print(f"FIFA: clicked '{sel}', now at {page.url}")
-                        signed_in = True
+                        print(f"FIFA: clicked sign-in, now at {page.url}")
                         break
                 except Exception:
                     pass
 
-            if signed_in or "login" in page.url.lower() or "signin" in page.url.lower():
-                if DEBUG_MODE:
-                    await page.screenshot(path="fifa_login_before.png")
-                    print(f"FIFA: login page title = {await page.title()}")
+            if DEBUG_MODE:
+                await page.screenshot(path="fifa_login_before.png")
+                print(f"FIFA: login page title = {await page.title()}")
 
-                # Fill email — handle single-page and two-step flows
-                for sel in ["input[type='email']", "input[name='email']",
-                            "input[id*='email' i]", "input[placeholder*='email' i]",
-                            "input[autocomplete='email']", "input[autocomplete='username']"]:
-                    try:
-                        el = page.locator(sel).first
-                        if await el.is_visible(timeout=2000):
-                            await el.fill(FIFA_EMAIL)
-                            print(f"FIFA: filled email via '{sel}'")
-                            break
-                    except Exception:
-                        pass
+            # Email — handles single-step and two-step flows
+            for sel in ["input[type='email']", "input[name='email']",
+                        "input[autocomplete='email']", "input[autocomplete='username']",
+                        "input[id*='email' i]", "input[placeholder*='email' i]"]:
+                try:
+                    el = page.locator(sel).first
+                    if await el.is_visible(timeout=2000):
+                        await el.fill(FIFA_EMAIL)
+                        print(f"FIFA: filled email via '{sel}'")
+                        break
+                except Exception:
+                    pass
 
-                # Some flows: email → Continue → password on next screen
-                for sel in ["button:has-text('Continue')", "button:has-text('Next')"]:
-                    try:
-                        el = page.locator(sel).first
-                        if await el.is_visible(timeout=1500):
-                            await el.click()
-                            await page.wait_for_timeout(2000)
-                            break
-                    except Exception:
-                        pass
+            for sel in ["button:has-text('Continue')", "button:has-text('Next')"]:
+                try:
+                    el = page.locator(sel).first
+                    if await el.is_visible(timeout=1500):
+                        await el.click()
+                        await page.wait_for_timeout(2000)
+                        break
+                except Exception:
+                    pass
 
-                # Fill password
-                for sel in ["input[type='password']", "input[name='password']",
-                            "input[id*='password' i]", "input[autocomplete='current-password']"]:
-                    try:
-                        el = page.locator(sel).first
-                        if await el.is_visible(timeout=3000):
-                            await el.fill(FIFA_PASSWORD)
-                            print(f"FIFA: filled password via '{sel}'")
-                            break
-                    except Exception:
-                        pass
+            for sel in ["input[type='password']", "input[name='password']",
+                        "input[autocomplete='current-password']", "input[id*='password' i]"]:
+                try:
+                    el = page.locator(sel).first
+                    if await el.is_visible(timeout=3000):
+                        await el.fill(FIFA_PASSWORD)
+                        print(f"FIFA: filled password via '{sel}'")
+                        break
+                except Exception:
+                    pass
 
-                # Submit
-                for sel in ["button[type='submit']", "button:has-text('Sign in')",
-                            "button:has-text('Log in')", "button:has-text('Login')",
-                            "button:has-text('Continue')"]:
-                    try:
-                        el = page.locator(sel).first
-                        if await el.is_visible(timeout=2000):
-                            await el.click()
-                            await page.wait_for_timeout(5000)
-                            break
-                    except Exception:
-                        pass
+            for sel in ["button[type='submit']", "button:has-text('Sign in')",
+                        "button:has-text('Log in')", "button:has-text('Continue')"]:
+                try:
+                    el = page.locator(sel).first
+                    if await el.is_visible(timeout=2000):
+                        await el.click()
+                        await page.wait_for_timeout(5000)
+                        break
+                except Exception:
+                    pass
 
-                if DEBUG_MODE:
-                    await page.screenshot(path="fifa_login_after.png")
-                    print(f"FIFA: post-login url = {page.url}")
+            if DEBUG_MODE:
+                await page.screenshot(path="fifa_login_after.png")
+                print(f"FIFA: post-login url = {page.url}")
 
-                if "login" not in page.url.lower() and "signin" not in page.url.lower():
-                    print("FIFA: login successful")
-                else:
-                    print(f"FIFA: login may have failed, still at {page.url}")
+            if "login" not in page.url.lower() and "signin" not in page.url.lower():
+                print("FIFA: login successful")
+            else:
+                print(f"FIFA: login may have failed, still at {page.url}")
 
-        # Now browse ticket/resale listings
+        # Browse ticket/resale listings
         try:
-            print("FIFA: loading ticket listings...")
             await page.goto(FIFA_BASE_URL, wait_until="networkidle", timeout=45000)
             await page.wait_for_timeout(4000)
         except Exception as e:
@@ -271,10 +264,6 @@ async def scrape_fifa() -> list[dict]:
         await browser.close()
 
     print(f"FIFA: captured {len(captured)} API responses")
-    if DEBUG_MODE:
-        for r in captured:
-            print(f"  {r['url']}: {list(r['data'].keys()) if isinstance(r['data'], dict) else type(r['data']).__name__}")
-
     found = []
     for resp in captured:
         for ticket in _extract_json(resp["data"], "FIFA", FIFA_BASE_URL):
@@ -284,112 +273,118 @@ async def scrape_fifa() -> list[dict]:
     return found
 
 
-# ── StubHub scraper (DOM-based) ───────────────────────────────────────────────
-async def scrape_stubhub() -> list[dict]:
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
-        )
-        ctx = await browser.new_context(**_browser_args())
-        page = await ctx.new_page()
-        await stealth_async(page)
-
-        try:
-            print("StubHub: loading search page...")
-            await page.goto(STUBHUB_SEARCH_URL, wait_until="networkidle", timeout=45000)
-            await page.wait_for_timeout(5000)
-        except Exception as e:
-            print(f"StubHub: page load warning: {e}")
-
-        if DEBUG_MODE:
-            await page.screenshot(path="stubhub_results.png")
-            print(f"StubHub: page title = {await page.title()}")
-
-        # Extract event cards from the DOM using JavaScript
-        raw_cards = await page.evaluate("""() => {
-            const results = [];
-            // Collect all anchor elements pointing to event/ticket pages
-            document.querySelectorAll('a[href]').forEach(a => {
-                const href = a.href || '';
-                if (!href.includes('stubhub')) return;
-                const text = (a.innerText || a.textContent || '').trim();
-                if (!text || text.length < 10) return;
-                // Only keep cards that look like event listings (have a price)
-                if (!text.includes('$')) return;
-                results.push({ href, text });
-            });
-            // Also try common card container selectors
-            const selectors = [
-                '[data-testid*="card"]', '[data-testid*="event"]',
-                '[class*="EventCard"]', '[class*="event-card"]',
-                '[class*="primaryCard"]', '[class*="listing"]',
-            ];
-            selectors.forEach(sel => {
-                document.querySelectorAll(sel).forEach(el => {
-                    const text = (el.innerText || '').trim();
-                    const link = el.querySelector('a');
-                    if (text && text.includes('$')) {
-                        results.push({ href: link?.href || '', text });
-                    }
-                });
-            });
-            return results;
-        }""")
-
-        await browser.close()
-
-    print(f"StubHub: found {len(raw_cards)} raw DOM cards")
-    if DEBUG_MODE:
-        for c in raw_cards[:5]:
-            print(f"  href={c['href'][:80]}")
-            print(f"  text={c['text'][:200]}\n")
+# ── StubHub scraper (venue pages + full-text extraction) ─────────────────────
+async def _scrape_stubhub_venue(pw, venue_name: str, url: str) -> list[dict]:
+    ctx = await pw.chromium.launch(
+        headless=True,
+        args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+    )
+    browser = ctx
+    bctx = await browser.new_context(**_browser_args())
+    page = await bctx.new_page()
+    await stealth_async(page)
 
     found = []
-    seen_ids = set()
-    for card in raw_cards:
-        text = card.get("text", "")
-        href = card.get("href", STUBHUB_SEARCH_URL)
+    try:
+        print(f"StubHub: loading {venue_name} page...")
+        await page.goto(url, wait_until="domcontentloaded", timeout=45000)
 
-        if not is_target_venue(text):
-            continue
+        # Dismiss cookie/consent banners
+        for sel in ["button:has-text('Accept All')", "button:has-text('Accept')",
+                    "#onetrust-accept-btn-handler", "[data-testid*='accept']",
+                    "button:has-text('I Accept')"]:
+            try:
+                el = page.locator(sel).first
+                if await el.is_visible(timeout=2000):
+                    await el.click()
+                    await page.wait_for_timeout(1000)
+                    break
+            except Exception:
+                pass
 
-        price = parse_price(text)
-        if price is None or not (0 < price < MAX_PRICE_USD):
-            continue
+        # Wait for JS to render + scroll to trigger lazy loading
+        await page.wait_for_timeout(6000)
+        await page.evaluate("window.scrollTo(0, 800)")
+        await page.wait_for_timeout(2000)
 
-        # Identify venue
-        venue = next((v.title() for v in TARGET_VENUES if v in text.lower()), "Unknown Venue")
-        # Normalize some venue names
-        venue_map = {
-            "Metlife": "MetLife Stadium",
-            "Gillette": "Gillette Stadium",
-            "Lincoln Financial": "Lincoln Financial Field",
-            "East Rutherford": "MetLife Stadium",
-            "Foxborough": "Gillette Stadium",
-            "Foxboro": "Gillette Stadium",
-            "Philadelphia": "Lincoln Financial Field",
-        }
-        venue = venue_map.get(venue, venue)
+        if DEBUG_MODE:
+            await page.screenshot(path=f"stubhub_{venue_name.replace(' ', '_')}.png")
 
-        ticket_id = f"StubHub:{href or text[:60]}"
-        if ticket_id in seen_ids:
-            continue
-        seen_ids.add(ticket_id)
+        # Strategy 1: full page text scan for FIFA events with prices
+        body = await page.inner_text("body")
+        if DEBUG_MODE:
+            print(f"StubHub {venue_name}: body length={len(body)}")
+            for line in body.splitlines():
+                if any(k in line.lower() for k in ["fifa", "world cup", "$"]):
+                    print(f"  >> {line[:120]}")
 
-        # Best-effort match/date extraction from card text
-        lines = [l.strip() for l in text.splitlines() if l.strip()]
-        match_name = lines[0] if lines else "FIFA World Cup 2026"
+        lines = [l.strip() for l in body.splitlines() if l.strip()]
+        for i, line in enumerate(lines):
+            if not ("fifa" in line.lower() or "world cup" in line.lower()):
+                continue
+            context_lines = lines[max(0, i - 3): i + 6]
+            context = " ".join(context_lines)
+            price = parse_price(context)
+            if price and 0 < price < MAX_PRICE_USD:
+                date_match = re.search(
+                    r'\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2}', context)
+                found.append({
+                    "id": f"StubHub:{venue_name}:{line[:50]}:{price}",
+                    "source": "StubHub",
+                    "price": price,
+                    "venue": venue_name,
+                    "match": line[:100],
+                    "date": date_match.group(0) if date_match else "See link",
+                    "url": url,
+                })
 
-        found.append({
-            "id": ticket_id,
-            "source": "StubHub",
-            "price": price,
-            "venue": venue,
-            "match": match_name,
-            "date": "See link",
-            "url": href if href.startswith("http") else STUBHUB_SEARCH_URL,
-        })
+        # Strategy 2: anchor links with price text
+        links = await page.evaluate("""() =>
+            Array.from(document.querySelectorAll('a[href]'))
+                .map(a => ({ href: a.href, text: (a.innerText || '').trim() }))
+                .filter(x => x.text.length > 10 && x.text.includes('$'))
+        """)
+        for link in links:
+            text = link["text"]
+            if "fifa" not in text.lower() and "world cup" not in text.lower():
+                continue
+            price = parse_price(text)
+            if price and 0 < price < MAX_PRICE_USD:
+                first_line = next((l for l in text.splitlines() if l.strip()), text)[:100]
+                found.append({
+                    "id": f"StubHub:{link['href'][:80]}:{price}",
+                    "source": "StubHub",
+                    "price": price,
+                    "venue": venue_name,
+                    "match": first_line,
+                    "date": "See link",
+                    "url": link["href"] if link["href"].startswith("http") else url,
+                })
+
+    except Exception as e:
+        print(f"StubHub {venue_name}: error: {e}")
+    finally:
+        await bctx.close()
+        await browser.close()
+
+    return found
+
+
+async def scrape_stubhub() -> list[dict]:
+    async with async_playwright() as pw:
+        results = await asyncio.gather(*[
+            _scrape_stubhub_venue(pw, venue_name, url)
+            for venue_name, url in STUBHUB_VENUE_URLS.items()
+        ])
+
+    # Flatten and deduplicate
+    seen = set()
+    found = []
+    for batch in results:
+        for t in batch:
+            if t["id"] not in seen:
+                seen.add(t["id"])
+                found.append(t)
 
     print(f"StubHub: {len(found)} matching ticket(s)")
     return found
